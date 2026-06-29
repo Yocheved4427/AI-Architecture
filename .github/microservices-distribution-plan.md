@@ -1,204 +1,123 @@
-# Microservices Distribution Plan — WebApiShop
+## Plan for Decomposing WebApiShop Monolith into Microservices
 
-## Current State (Monolith)
-
-The app is a single ASP.NET Core Web API with layered architecture:
-
-```
-WebApiShop (entry point)
-├── Services        → business logic
-├── Repositories    → EF Core / SQL Server
-├── Entities        → domain models
-└── DTOs            → request/response shapes
-```
-
-All resources — **Products, Categories, Orders, OrderItems, Users, Ratings** — share one database (`NewApiShop`) and one runtime process.
+**TL;DR**  
+The existing ASP.NET Core monolith contains users, products, categories, orders, ratings and password logic. We’ll carve it into a set of bounded‑context services (User/Auth, Product/Catalog, Order, Rating, …), choose technology stacks per service (keep .NET where it makes sense but allow polyglot), and pick appropriate storage (relational for transactions, NoSQL/event store where eventual consistency is fine). The plan explains domains, service boundaries, data ownership, communication patterns and migration steps.
 
 ---
 
-## Target State (Microservices)
+### 1. **Domain Decomposition**
 
-Split into **5 independent services**, each owning its data and exposing its own HTTP API.
+1. **User/Authentication Service** (`UserSvc`)  
+   - Manages user profiles, registration, login, roles.  
+   - Holds `Users`, `Passwords` tables and zxcvbn validation.  
+   - Issue JWTs or integrate with OAuth2.  
+   - Language: C#/.NET (reuses existing code); could be Node/Go if team prefers polyglot.  
+   - DB: Relational (SQL Server or PostgreSQL) for strong consistency + ACID for credentials.
 
-```
-┌─────────────────────┐   ┌─────────────────────┐
-│   Product Service   │   │  Category Service   │
-│  /api/products      │   │  /api/categories    │
-│  DB: products_db    │   │  DB: categories_db  │
-└─────────────────────┘   └─────────────────────┘
+2. **Catalog Service**  
+   - Products + Categories.  
+   - Exposes product search, filtering, category hierarchy.  
+   - Language: C#/.NET initially; can evolve independently.  
+   - DB: Relational or document DB (e.g. PostgreSQL with JSONB, MongoDB) depending on query needs.
 
-┌─────────────────────┐   ┌─────────────────────┐
-│   Order Service     │   │   User Service      │
-│  /api/orders        │   │  /api/users         │
-│  DB: orders_db      │   │  DB: users_db       │
-└─────────────────────┘   └─────────────────────┘
+3. **Order Service**  
+   - Handles orders, order items, status, inventory reservation if added later.  
+   - Owns `Orders`/`OrderItems` entities and orchestrates fulfilment.  
+   - Language: C# or JVM/Go for performance.  
+   - DB: Relational for transactional integrity; consider separate SQL instance.
 
-┌─────────────────────┐
-│  Analytics Service  │
-│  /api/ratings       │
-│  DB: analytics_db   │
-└─────────────────────┘
+4. **Rating Service**  
+   - Manages product ratings & reviews.  
+   - Can be eventual‑consistent; denormalized read models.  
+   - Language: lightweight (Go, Node, .NET).  
+   - DB: Document store (MongoDB/Cosmos) or relational with simpler schema.
 
-            ↑ all behind
-    ┌───────────────────┐
-    │    API Gateway    │  (e.g. YARP / Ocelot)
-    │  auth, routing,   │
-    │  rate limiting    │
-    └───────────────────┘
-```
+5. **Category Service** (optional split)  
+   - If category tree becomes complex, treat separately; otherwise embed in Catalog.
 
----
+6. **Gateway/API Aggregator**  
+   - Front door for clients; routes requests to services, handles auth, rate‑limit.  
+   - Could be Kong, Ocelot (.NET) or NGINX with Lua.
 
-## Service Breakdown
-
-### 1. Product Service
-| Item | Detail |
-|---|---|
-| Owns | `Product` entity, `ProductsRepository`, `ProductsServices` |
-| Endpoints | `GET /api/products`, `GET /api/products/{id}`, `POST`, `PUT`, `DELETE` |
-| Database | `products_db` — `Products` table |
-| Depends on | Category Service (read-only, via HTTP for category name enrichment) |
-| Caching | Redis — cache-aside on `GetProducts()` (already implemented) |
-
-### 2. Category Service
-| Item | Detail |
-|---|---|
-| Owns | `Category` entity, `CategoriesRepository`, `CategoriesServices` |
-| Endpoints | `GET /api/categories`, `POST`, `PUT`, `DELETE` |
-| Database | `categories_db` — `Categories` table |
-| Depends on | None |
-
-### 3. Order Service
-| Item | Detail |
-|---|---|
-| Owns | `Order`, `OrderItem` entities, repositories, services |
-| Endpoints | `GET /api/orders`, `GET /api/orders/{id}`, `POST`, `PUT`, `DELETE` |
-| Database | `orders_db` — `Orders` + `Order_Item` tables |
-| Depends on | User Service (validate user exists), Product Service (validate product + price) |
-| Async events | Publishes `OrderPlaced` event → message broker (e.g. RabbitMQ / Azure Service Bus) |
-
-### 4. User Service
-| Item | Detail |
-|---|---|
-| Owns | `User` entity, `UserRepository`, `UserServices`, `PasswordServices` |
-| Endpoints | `POST /api/users` (register), `GET /api/users/{id}`, `PUT`, `DELETE` |
-| Endpoints | `POST /api/password/login` → issues JWT |
-| Database | `users_db` — `Users` table |
-| Auth | This service is the **JWT issuer** — all other services validate tokens |
-
-### 5. Analytics Service
-| Item | Detail |
-|---|---|
-| Owns | `Rating` entity, `RatingRepository`, `RatingService` |
-| Endpoints | `GET /api/ratings` (internal only) |
-| Database | `analytics_db` — `Ratings` table |
-| Input | Listens for HTTP calls from `RatingMiddleware` (or consumes events from broker) |
+7. **Common/Shared Libraries**  
+   - DTOs, logging, error middleware can be packaged as NuGet or kept in separate repos for reuse.
 
 ---
 
-## API Gateway
+### 2. **Technology & Storage Recommendations**
 
-Replace the current per-service JWT + rate-limiting middleware with a centralized gateway:
+- **Languages**  
+  - **Primary**: Continue with C#/.NET to leverage existing codebase, teams, and integrations.  
+  - **Polyglot Option**: Allow teams to pick Go, Node.js, Java, Python for new services if justified by domain requirements (e.g. high‑performance order engine in Go).  
+  - **Rationale**: microservices enable technology experimentation; start with .NET for minimal disruption.
 
-| Responsibility | Current Location | Target Location |
-|---|---|---|
-| JWT validation | each service | API Gateway |
-| Rate limiting (`RateLimitingMiddleware`) | WebApiShop | API Gateway |
-| Request routing | monolith routing | Gateway routes table |
-| HTTPS termination | each service | API Gateway |
-
-Recommended: **YARP** (Yet Another Reverse Proxy) — native .NET 9, integrates with ASP.NET Core DI.
-
----
-
-## Shared Concerns
-
-| Concern | Approach |
-|---|---|
-| Shared DTOs | Publish a `WebApiShop.Contracts` NuGet package (or git submodule) containing shared record types |
-| Service discovery | Kubernetes DNS or Consul |
-| Distributed tracing | OpenTelemetry → Jaeger / Azure Monitor |
-| Logging | Serilog → centralized sink (Seq / ELK) |
-| Health checks | `app.MapHealthChecks("/health")` in every service |
+- **Databases**  
+  - **Relational (SQL Server, PostgreSQL)** for user credentials, orders, transactional consistency.  
+  - **Document/NoSQL (MongoDB, Cosmos DB, DynamoDB)** for ratings, catalog metadata where flexible schema helps.  
+  - **Event Store or Kafka** for cross‑service events (order placed, product updated).  
+  - **Per‑service DB ownership**: no shared database; each service owns its schema to avoid coupling.
 
 ---
 
-## Migration Phases
+### 3. **Communication Patterns**
 
-### Phase 1 — Strangler Fig (no downtime)
-1. Deploy an API Gateway in front of the existing monolith.
-2. Route all traffic through the gateway (monolith is the single backend).
-
-### Phase 2 — Extract User Service
-- Lowest coupling; no foreign keys to other tables.
-- Move `Users` table to `users_db`, update gateway routing.
-- Validate JWT issuance works independently.
-
-### Phase 3 — Extract Category Service
-- No dependencies on other services.
-- Update Product Service to call Category Service by HTTP for enrichment.
-
-### Phase 4 — Extract Product Service
-- Remove Redis dependency from monolith; keep it in Product Service only.
-- Publish `ProductPriceChanged` event when price is updated.
-
-### Phase 5 — Extract Order Service
-- Consume `UserValidated` and `ProductValidated` events or make sync HTTP calls.
-- Publish `OrderPlaced` event to message broker.
-
-### Phase 6 — Extract Analytics Service
-- Update `RatingMiddleware` to call Analytics Service endpoint instead of writing to DB directly.
-
-### Phase 7 — Decommission Monolith
+1. **Synchronous HTTP/REST** between gateway and services.  
+2. **Asynchronous messaging** (RabbitMQ/Kafka) for events: `OrderCreated`, `ProductUpdated`, `UserRegistered`.  
+3. **API contracts**: use OpenAPI specs; each service publishes its own swagger.
 
 ---
 
-## Folder Structure per Service
+### 4. **Migration Strategy**
 
-Each extracted service follows the same internal layered structure as the monolith:
+1. **Extract services one at a time**  
+   - Begin with low‑risk domain (Rating or Catalog).  
+   - Create new repos/projects with existing controllers/services mapped.  
+   - Deploy side‑by‑side with monolith; modify gateway to route.
 
-```
-ProductService/
-├── ProductService.sln
-├── ProductService/         ← Controllers, Middleware, Program.cs
-├── ProductService.Services/
-├── ProductService.Repositories/
-├── ProductService.Entities/
-├── ProductService.DTOs/
-└── ProductService.Tests/
-```
+2. **Data replication**  
+   - For initial reads, replicate data from monolith DB to service DB via change data capture or ETL.  
+   - Stop updating monolith for that domain once service is live.
+
+3. **Strangling the monolith**  
+   - Gradually move controllers and business logic into services.  
+   - Replace internal calls with HTTP/message calls.
+
+4. **Testing & Validation**  
+   - Maintain existing unit/integration tests per service.  
+   - Add contract tests (Pact) to ensure backward compatibility.
+
+5. **Deployment**  
+   - Containerize each service (Docker).  
+   - Use orchestration (Kubernetes, Docker Compose) for local dev.  
+   - CI/CD pipelines per service.
+
+6. **Operational concerns**  
+   - Centralized logging (ELK/Seq) and monitoring (Prometheus/Grafana).  
+   - Circuit breakers, retries (Polly).  
+   - Version APIs carefully; deprecate monolith endpoints.
 
 ---
 
-## Docker Compose Skeleton
+### 5. **Verification**
 
-```yaml
-services:
-  gateway:
-    image: webapishop-gateway
-    ports: ["443:443"]
+- **Manual Checks**  
+  - Hit gateway endpoints and confirm correct service responses.  
+  - Ensure user registration/login works after migration.
+- **Automated Tests**  
+  - Run service-specific unit tests with `dotnet test`.  
+  - Execute integration tests targeting individual service databases and through gateway.  
+- **Load Testing**  
+  - Benchmark services independently to validate DB choices.
 
-  product-service:
-    image: webapishop-products
-    environment:
-      - ConnectionStrings__DefaultConnection=...
-      - Redis__ConnectionString=redis:6379
+---
 
-  category-service:
-    image: webapishop-categories
+### 6. **Decisions**
 
-  order-service:
-    image: webapishop-orders
+- Start with all services in C#/.NET to leverage code reuse.  
+- Use SQL Server for transactional services; consider PostgreSQL for new deploys to avoid vendor lock‑in.  
+- Allow eventual polyglot expansion after first two services are stable.  
+- Adopt event‑driven communication for decoupling and scalability.
 
-  user-service:
-    image: webapishop-users
+---
 
-  analytics-service:
-    image: webapishop-analytics
-
-  redis:
-    image: redis:7-alpine
-
-  sqlserver:
-    image: mcr.microsoft.com/mssql/server:2022-latest
-```
+This plan gives the technical roadmap for decomposing the monolith, choosing language/DB per domain, and migrating incrementally while maintaining functionality.
