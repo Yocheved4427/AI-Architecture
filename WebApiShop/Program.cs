@@ -62,8 +62,8 @@ builder.Services.AddScoped<IJwtService, JwtService>();
 builder.Services.AddSingleton<IKafkaProducerService, KafkaProducerService>();
 
 
-var redisCon = builder.Configuration.GetValue<string>("Redis:ConnectionString");
-if (!string.IsNullOrEmpty(redisCon))
+var redisSetting = builder.Configuration.GetValue<string>("Redis:ConnectionString");
+if (!string.IsNullOrEmpty(redisSetting))
 {
     var redisPassword = builder.Configuration["REDIS_PASSWORD"];
 
@@ -72,11 +72,11 @@ if (!string.IsNullOrEmpty(redisCon))
         throw new InvalidOperationException("REDIS_PASSWORD is missing");
     }
 
-    var redisCon = $"localhost:6379,password={redisPassword},abortConnect=false";
+    var redisConnection = $"localhost:6379,password={redisPassword},abortConnect=false";
    
     builder.Services.AddSingleton<IConnectionMultiplexer>(
 
-        ConnectionMultiplexer.Connect(redisCon));
+        ConnectionMultiplexer.Connect(redisConnection));
 }
 
 var jwtSettings = builder.Configuration.GetSection("JwtSettings");
